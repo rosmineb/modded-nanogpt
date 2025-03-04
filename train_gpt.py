@@ -9,6 +9,7 @@ import glob
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import math
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -155,10 +156,10 @@ class Muon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
+    def __init__(self, params, lr=0.02, momentum=0.95, beta2=None, nesterov=True, ns_steps=5, rank=0, world_size=1, eps=1e-8):
         self.rank = rank
         self.world_size = world_size
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, beta2=beta2, eps=eps)
         params: list[Tensor] = [*params]
         param_groups = []
         for size in {p.numel() for p in params}:
@@ -190,9 +191,23 @@ class Muon(torch.optim.Optimizer):
                     state = self.state[p]
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(g)
+                    if group['beta2'] is not None and "exp_avg_sq" not in state:
+                        state["exp_avg_sq"] = torch.zeros_like(g)
+                    if 'step' not in state:
+                        state['step'] = 0
+                    state['step'] += 1
                     buf: Tensor = state["momentum_buffer"]
+                    if group["beta2"] is not None:
+                        exp_avg_sq: Tensor = state["exp_avg_sq"]
                     buf.lerp_(g, 1 - group["momentum"])
+                    if group['beta2'] is not None:
+                        exp_avg_sq.mul_(group['beta2']).addcmul(g, g, value=1 - group['beta2'])
                     g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+                    if group['beta2'] is not None:
+                        denom = (exp_avg_sq.sqrt() / math.sqrt(1 - group['beta2'] ** state['step'])) + group['eps']
+                        g = g / denom
+                    else:
+                        assert False
                     g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
                 else:
                     g = update_buffer_views[self.rank]
@@ -516,7 +531,7 @@ adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, beta2=0.9995, nesterov=True, rank=rank, world_size=world_size)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
